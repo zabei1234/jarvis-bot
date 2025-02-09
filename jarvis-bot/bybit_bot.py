@@ -1,224 +1,437 @@
-import requests
-from pybit.unified_trading import HTTP
-from telegram import Bot
-from telegram.ext import Application
-import logging
+import os
 import time
-import numpy as np
-import asyncio
-import socket
+import logging
+import requests
+import traceback
+import pandas as pd
+from decimal import Decimal, ROUND_DOWN
+from dotenv import load_dotenv
+from pybit.unified_trading import HTTP
+import ta
 
-# Логирование
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()  # Добавляем вывод логов в терминал
-    ]
-)
+load_dotenv()
 
-# Конфигурация
-TELEGRAM_TOKEN = '8153580145:AAED83h9IodTvOH3DmrdPjsinS9K94nSEk0'
-CHAT_ID = '1330519186'
-BYBIT_API_KEY = 'TUBkHXS7hyF8Y9i1hJ'
-BYBIT_API_SECRET = 'K1dlpR4sO6MVSjnkML1noQYTcD9vq4QdstDU'
+class TradeBot:
+    def __init__(self):
+        self.IS_TESTNET = False
+        self.BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+        self.BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+        self.TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+        self.CHAT_ID = os.getenv("CHAT_ID")
 
-# Инициализация клиентов
-app = Application.builder().token(TELEGRAM_TOKEN).build()
-client = HTTP(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET, recv_window=5000, timeout=30)
-MIN_TRADE_QTY = 0.01  # Минимально допустимый объём сделки для ETHUSDT
-MIN_TRADE_BALANCE = 10  # Минимальный баланс для торговли в USDT
+        self.LEVERAGE = Decimal("10")
+        self.BALANCE_ALLOCATION = Decimal("0.5")
+        self.STOP_LOSS_PERCENT = Decimal("0.03")
+        self.MAX_TRADES = 10
+        self.RESERVE_PERCENT = Decimal("0.001")
+        self.COMMISSION_RATE = Decimal("0.001")
+        self.MAX_RETRIES = 3
+        self.REDUCE_STEP = Decimal("0.9")
+        self.REVERSAL_DROP = Decimal("0.005")
+        self.ATR_STOP_MULTIPLIER = Decimal("1.2")
+        self.HIGHER_TF = "5"
+        self.HIGHER_TF_EMA_WINDOW = 50
+        self.TP_PARTIAL_LEVEL = Decimal("0.01")
+        self.TP_PARTIAL_SIZE = Decimal("0.5")
 
-# Параметры управления рисками
-STOP_LOSS_PERCENT = 2  # Уровень стоп-лосса в процентах
-TAKE_PROFIT_PERCENT = 10  # Уровень тейк-профита в процентах
-
-# Список символов для анализа
-SYMBOLS_TO_TRADE = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT"]
-
-# Логирование текущего IP
-try:
-    current_ip = socket.gethostbyname(socket.gethostname())
-    logging.info(f"IP-адрес бота: {current_ip}")
-except Exception as e:
-    logging.error(f"Ошибка определения IP-адреса: {e}")
-
-# Флаг для отслеживания состояния
-last_message = None
-
-async def send_telegram_message(message):
-    global last_message
-    try:
-        # Отправляем сообщение только если оно отличается от предыдущего
-        if message != last_message:
-            await app.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
-            logging.info(f"Telegram message sent: {message}")
-            last_message = message
-    except Exception as e:
-        logging.error(f"Ошибка отправки сообщения в Telegram: {e}")
-
-# Форматирование сообщения для Telegram
-def format_balance_message(usdt_balance):
-    return (
-        f"<b>Текущий баланс:</b>\n"
-        f"<b>USDT:</b> {usdt_balance:.2f}\n"
-        f"<b>Минимальный баланс для торговли:</b> {MIN_TRADE_BALANCE} USDT"
-    )
-
-def format_trade_message(symbol, side, qty, price):
-    return (
-        f"<b>Сделка совершена:</b>\n"
-        f"<b>Символ:</b> {symbol}\n"
-        f"<b>Тип:</b> {'Лонг' if side == 'Buy' else 'Шорт'}\n"
-        f"<b>Объём:</b> {qty}\n"
-        f"<b>Цена входа:</b> {price:.2f}"
-    )
-
-# Расчёт RSI
-def calculate_rsi(closes, period=14):
-    deltas = np.diff(closes)
-    seed = deltas[:period]
-    up = seed[seed >= 0].sum() / period
-    down = -seed[seed < 0].sum() / period
-    rs = up / down if down > 0 else float('inf')
-    rsi = np.zeros_like(closes)
-    rsi[:period] = 100 - 100 / (1 + rs)
-    for i in range(period, len(closes)):
-        delta = deltas[i - 1]
-        if delta > 0:
-            upval = delta
-            downval = 0
-        else:
-            upval = 0
-            downval = -delta
-        up = (up * (period - 1) + upval) / period
-        down = (down * (period - 1) + downval) / period
-        rs = up / down if down > 0 else float('inf')
-        rsi[i] = 100 - 100 / (1 + rs)
-    return rsi[-1]
-
-# Расчёт MACD
-def calculate_macd(closes, short_period=12, long_period=26, signal_period=9):
-    short_ema = np.convolve(closes, np.ones(short_period) / short_period, mode='valid')
-    long_ema = np.convolve(closes, np.ones(long_period) / short_period, mode='valid')
-    macd_line = short_ema[-len(long_ema):] - long_ema
-    signal_line = np.convolve(macd_line, np.ones(signal_period) / short_period, mode='valid')
-    return macd_line[-1], signal_line[-1]
-
-# Расчёт Bollinger Bands
-def calculate_bollinger_bands(closes, period=20, num_std_dev=2):
-    sma = np.convolve(closes, np.ones(period) / period, mode='valid')
-    std_dev = np.std(closes[-period:])
-    upper_band = sma[-1] + (num_std_dev * std_dev)
-    lower_band = sma[-1] - (num_std_dev * std_dev)
-    return upper_band, lower_band
-
-# Расчёт ATR
-def calculate_atr(highs, lows, closes, period=14):
-    tr = np.maximum(highs[1:] - lows[1:], np.maximum(abs(highs[1:] - closes[:-1]), abs(lows[1:] - closes[:-1])))
-    atr = np.convolve(tr, np.ones(period) / period, mode='valid')
-    return atr[-1]
-
-# Анализ рынка с несколькими индикаторами
-def analyze_market(symbol):
-    try:
-        response = client.get_kline(category="linear", symbol=symbol, interval="15", limit=50)
-        candles = response.get("result", {}).get("list", [])
-        if not candles:
-            logging.warning(f"Нет данных свечей для {symbol}.")
-            return None
-
-        closes = np.array([float(c[4]) for c in candles])
-        highs = np.array([float(c[2]) for c in candles])
-        lows = np.array([float(c[3]) for c in candles])
-
-        rsi = calculate_rsi(closes)
-        macd, signal = calculate_macd(closes)
-        upper_band, lower_band = calculate_bollinger_bands(closes)
-        atr = calculate_atr(highs, lows, closes)
-
-        logging.info(
-            f"Анализ {symbol}: RSI={rsi:.2f}, MACD={macd:.2f}, Signal={signal:.2f}, "
-            f"Upper BB={upper_band:.2f}, Lower BB={lower_band:.2f}, ATR={atr:.2f}"
+        self.client = HTTP(
+            api_key=self.BYBIT_API_KEY,
+            api_secret=self.BYBIT_API_SECRET,
+            testnet=self.IS_TESTNET,
+            timeout=30
         )
-        return rsi, macd, signal, upper_band, lower_band, atr
-    except Exception as e:
-        logging.error(f"Ошибка анализа рынка для {symbol}: {e}")
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        logging.getLogger().addHandler(logging.FileHandler("trade_log.txt"))
+
+        self.active_trades = {}
+        self.symbols = [
+            "BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT",
+            "JUPUSDT", "AEROUSDT", "JTOUSDT", "CFXUSDT", "TAOUSDT",
+            "RAREUSDT", "LEVERUSDT", "MBOXUSDT", "EIGENUSDT", "FLRUSDT"
+        ]
+
+    def send_telegram_message(self, message):
+        url = f"https://api.telegram.org/bot{self.TELEGRAM_TOKEN}/sendMessage"
+        data = {"chat_id": self.CHAT_ID, "text": message, "parse_mode": "HTML"}
+        try:
+            requests.post(url, data=data, timeout=10)
+        except Exception:
+            logging.error("Telegram send error")
+            logging.error(traceback.format_exc())
+
+    def get_balance(self):
+        try:
+            response = self.client.get_wallet_balance(accountType="UNIFIED")
+            balance_info = response["result"]["list"][0]
+            total_balance = Decimal(balance_info.get("totalWalletBalance", "0"))
+            available_balance = Decimal(balance_info.get("availableBalance", str(total_balance)))
+            used_margin = Decimal(balance_info.get("usedMargin", "0"))
+            safe_balance = max(Decimal("0"), available_balance - (available_balance * self.RESERVE_PERCENT))
+            logging.info(f"💰 Доступный баланс: {available_balance} USDT | "
+                         f"Чистая маржа: {total_balance - used_margin} USDT | "
+                         f"Используемая маржа: {used_margin} USDT | "
+                         f"Реально доступно: {safe_balance} USDT")
+            return total_balance, safe_balance
+        except Exception:
+            logging.error("Error getting balance")
+            logging.error(traceback.format_exc())
+            return Decimal("0"), Decimal("0")
+
+    def get_trade_limits(self, symbol):
+        try:
+            response = self.client.get_instruments_info(category="linear", symbol=symbol)
+            min_qty = Decimal(response["result"]["list"][0]["lotSizeFilter"]["minOrderQty"])
+            step_size = Decimal(response["result"]["list"][0]["lotSizeFilter"]["qtyStep"])
+            logging.info(f"🔍 {symbol} | Мин. объем: {min_qty}, Шаг: {step_size}")
+            return min_qty, step_size
+        except Exception:
+            logging.error("Error getting trade limits")
+            logging.error(traceback.format_exc())
+            return Decimal("0"), Decimal("1")
+
+    def round_step(self, value, step_size):
+        multiplier = Decimal("1") / step_size
+        return (Decimal(value) * multiplier // 1) / multiplier
+
+    def get_ohlcv_data(self, symbol, interval="1", limit=200, start_time=None):
+        try:
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit
+            }
+            if start_time is not None:
+                params["from"] = start_time
+            kline_data = self.client.get_kline(**params)
+            if "result" not in kline_data or "list" not in kline_data["result"]:
+                return pd.DataFrame()
+            df = pd.DataFrame(kline_data["result"]["list"], columns=[
+                "startTime", "open", "high", "low", "close", "volume", "turnover"
+            ])
+            df["startTime"] = pd.to_datetime(df["startTime"].astype(int), unit="ms")
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
+            return df.sort_values("startTime").reset_index(drop=True)
+        except Exception:
+            logging.error(f"Error fetching OHLCV for {symbol} interval {interval}")
+            logging.error(traceback.format_exc())
+            return pd.DataFrame()
+
+    def calculate_indicators(self, df):
+        if df.empty:
+            return {}
+        df["rsi"] = ta.momentum.rsi(df["close"], window=14)
+        macd = ta.trend.MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd"] = macd.macd()
+        df["macd_signal"] = macd.macd_signal()
+        df["macd_hist"] = macd.macd_diff()
+        stoch = ta.momentum.StochRSIIndicator(df["close"], window=14, smooth1=3, smooth2=3)
+        df["stoch_k"] = stoch.stochrsi_k()
+        df["stoch_d"] = stoch.stochrsi_d()
+        df["ema_50"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
+        atr_indicator = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14)
+        df["atr"] = atr_indicator.average_true_range()
+        df["vol_ma"] = df["volume"].rolling(window=20).mean()
+        latest = df.iloc[-1]
+        return {
+            "rsi": Decimal(str(latest["rsi"])),
+            "macd_hist": Decimal(str(latest["macd_hist"])),
+            "stoch_k": Decimal(str(latest["stoch_k"])),
+            "stoch_d": Decimal(str(latest["stoch_d"])),
+            "ema_50": Decimal(str(latest["ema_50"])),
+            "atr": Decimal(str(latest["atr"])),
+            "volume": Decimal(str(latest["volume"])),
+            "vol_ma": Decimal(str(latest["vol_ma"])) if pd.notna(latest["vol_ma"]) else Decimal("0"),
+            "last_open": Decimal(str(latest["open"])),
+            "last_close": Decimal(str(latest["close"]))
+        }
+
+    def calculate_higher_tf_direction(self, symbol):
+        df = self.get_ohlcv_data(symbol, interval=self.HIGHER_TF, limit=200)
+        if df.empty or len(df) < self.HIGHER_TF_EMA_WINDOW:
+            return None
+        df["ema_higher"] = ta.trend.EMAIndicator(df["close"], window=self.HIGHER_TF_EMA_WINDOW).ema_indicator()
+        last = df.iloc[-1]
+        if last["close"] > last["ema_higher"]:
+            return "up"
+        elif last["close"] < last["ema_higher"]:
+            return "down"
         return None
 
-# Открытие сделки с управлением рисками
-def open_trade_with_risk_management(symbol, side, qty, entry_price):
-    stop_loss_price = entry_price * (1 - STOP_LOSS_PERCENT / 100) if side == "Buy" else entry_price * (1 + STOP_LOSS_PERCENT / 100)
-    take_profit_price = entry_price * (1 + TAKE_PROFIT_PERCENT / 100) if side == "Buy" else entry_price * (1 - TAKE_PROFIT_PERCENT / 100)
+    def check_entry_conditions(self, symbol, indicators):
+        vol_check = indicators.get("volume", Decimal("0")) >= indicators.get("vol_ma", Decimal("0")) * Decimal("0.2")
+        if not vol_check:
+            return None
 
-    try:
-        response = client.place_active_order(
-            category="linear",
-            symbol=symbol,
-            side=side,
-            orderType="Market",
-            qty=qty,
-            timeInForce="GoodTillCancel",
-            stopLoss=str(stop_loss_price),
-            takeProfit=str(take_profit_price)
+        rsi_val = indicators.get("rsi", Decimal("50"))
+        stoch_k_val = indicators.get("stoch_k", Decimal("50"))
+        stoch_d_val = indicators.get("stoch_d", Decimal("50"))
+        macd_hist = indicators.get("macd_hist", Decimal("0"))
+        last_open = indicators.get("last_open", Decimal("0"))
+        last_close = indicators.get("last_close", Decimal("0"))
+        ema_50 = indicators.get("ema_50", Decimal("0"))
+        higher_direction = self.calculate_higher_tf_direction(symbol)
+
+        buy_cond = (
+            rsi_val < Decimal("45") and
+            stoch_k_val > stoch_d_val and
+            macd_hist > 0 and
+            last_close > last_open and
+            last_close > ema_50 and
+            higher_direction == "up"
         )
-        logging.info(f"Сделка с управлением рисками открыта: {response}")
-    except Exception as e:
-        logging.error(f"Ошибка открытия сделки с управлением рисками для {symbol}: {e}")
+        sell_cond = (
+            rsi_val > Decimal("60") and
+            stoch_k_val < stoch_d_val and
+            macd_hist < 0 and
+            last_close < last_open and
+            last_close < ema_50 and
+            higher_direction == "down"
+        )
 
-# Основной цикл
-async def run_bot():
-    while True:
+        if buy_cond:
+            return "Buy"
+        elif sell_cond:
+            return "Sell"
+        return None
+
+    def restore_active_trades(self):
         try:
-            logging.info("Запуск торговой логики.")
-            response = client.get_wallet_balance(accountType="UNIFIED")
-            balances = response.get("result", {}).get("list", [])[0].get("coin", [])
+            positions = self.client.get_positions(category="linear", settleCoin="USDT")
+            if "result" in positions and "list" in positions["result"]:
+                for pos in positions["result"]["list"]:
+                    size = Decimal(pos["size"])
+                    if size != 0:
+                        symbol = pos["symbol"]
+                        side = pos["side"]
+                        entry_price = Decimal(pos["entryPrice"])
+                        stop_loss = Decimal(pos.get("stopLoss", entry_price))
+                        self.active_trades[symbol] = {
+                            "side": side,
+                            "entry_price": entry_price,
+                            "qty": size,
+                            "stop_loss": stop_loss,
+                            "prev_price": entry_price,
+                            "partial_tp_done": False
+                        }
+                        if side == "Buy":
+                            self.active_trades[symbol]["highest_price"] = entry_price
+                        else:
+                            self.active_trades[symbol]["lowest_price"] = entry_price
+        except Exception:
+            logging.error("Error restoring active trades")
+            logging.error(traceback.format_exc())
 
-            usdt_balance = None
-            for coin in balances:
-                if coin.get("coin") == "USDT":
+    def open_trade(self, symbol):
+        if symbol in self.active_trades or len(self.active_trades) >= self.MAX_TRADES:
+            return
+        total_balance, safe_balance = self.get_balance()
+        min_qty, step_size = self.get_trade_limits(symbol)
+
+        df = self.get_ohlcv_data(symbol, interval="1", limit=200)
+        indicators = self.calculate_indicators(df)
+        side = self.check_entry_conditions(symbol, indicators)
+        if not side:
+            return
+
+        trade_amount = (safe_balance * self.BALANCE_ALLOCATION) * self.LEVERAGE
+        retries = 0
+        while retries < self.MAX_RETRIES:
+            try:
+                required_margin = trade_amount / self.LEVERAGE
+                if required_margin > safe_balance:
+                    trade_amount *= self.REDUCE_STEP
+                trade_amount -= trade_amount * self.COMMISSION_RATE
+                trade_amount = self.round_step(trade_amount, step_size).quantize(step_size, rounding=ROUND_DOWN)
+                if trade_amount < min_qty:
+                    return
+                price_data = self.client.get_tickers(category="linear", symbol=symbol)
+                current_price = Decimal(price_data["result"]["list"][0]["lastPrice"])
+                notional_value = trade_amount * current_price
+                own_funds = notional_value / self.LEVERAGE
+                borrowed_funds = notional_value - own_funds
+                response = self.client.place_order(
+                    category="linear",
+                    symbol=symbol,
+                    side=side,
+                    orderType="Market",
+                    qty=str(trade_amount),
+                    reduceOnly=False
+                )
+                if "result" in response and "orderId" in response["result"]:
+                    atr_val = indicators.get("atr", Decimal("0"))
+                    if side == "Buy":
+                        atr_stop = current_price - (atr_val * self.ATR_STOP_MULTIPLIER)
+                        fixed_stop = current_price * (Decimal("1") - self.STOP_LOSS_PERCENT)
+                        initial_stop = min(fixed_stop, atr_stop) if atr_val > 0 else fixed_stop
+                    else:
+                        atr_stop = current_price + (atr_val * self.ATR_STOP_MULTIPLIER)
+                        fixed_stop = current_price * (Decimal("1") + self.STOP_LOSS_PERCENT)
+                        initial_stop = max(fixed_stop, atr_stop) if atr_val > 0 else fixed_stop
                     try:
-                        usdt_balance = float(coin.get("walletBalance", 0))
-                        break
-                    except ValueError:
-                        logging.error("Ошибка преобразования баланса USDT в число.")
+                        self.client.set_trading_stop(
+                            category="linear",
+                            symbol=symbol,
+                            side=side,
+                            positionIdx=0,
+                            stopLoss=str(initial_stop)
+                        )
+                    except Exception:
+                        logging.error("Error setting stop loss")
+                        logging.error(traceback.format_exc())
+                    self.active_trades[symbol] = {
+                        "side": side,
+                        "entry_price": current_price,
+                        "own_funds": own_funds,
+                        "borrowed_funds": borrowed_funds,
+                        "notional": notional_value,
+                        "qty": trade_amount,
+                        "stop_loss": initial_stop,
+                        "prev_price": current_price,
+                        "partial_tp_done": False
+                    }
+                    if side == "Buy":
+                        self.active_trades[symbol]["highest_price"] = current_price
+                    else:
+                        self.active_trades[symbol]["lowest_price"] = current_price
+                    self.send_telegram_message(
+                        f"✅ Открыта {side} сделка по {symbol}\n"
+                        f"Объём: {notional_value:.2f} USDT\n"
+                        f"Собственные: {own_funds:.2f} USDT\n"
+                        f"Заёмные: {borrowed_funds:.2f} USDT\n"
+                        f"Цена входа: {current_price}\n"
+                        f"Стоп-лосс: {initial_stop}"
+                    )
+                    return
+            except Exception:
+                logging.error("Error placing order")
+                logging.error(traceback.format_exc())
+            retries += 1
+            trade_amount *= self.REDUCE_STEP
+            time.sleep(1)
 
-            if usdt_balance is None:
-                logging.warning("Не удалось получить баланс USDT.")
-                await send_telegram_message("Ошибка получения баланса USDT.")
-                continue
+    def partial_close_trade(self, symbol, fraction=None):
+        if symbol not in self.active_trades:
+            return
+        fraction = fraction or self.TP_PARTIAL_SIZE
+        info = self.active_trades[symbol]
+        old_qty = info["qty"]
+        close_qty = old_qty * fraction
+        if close_qty < Decimal("1"):
+            return
+        side = "Sell" if info["side"] == "Buy" else "Buy"
+        try:
+            self.client.place_order(
+                category="linear",
+                symbol=symbol,
+                side=side,
+                orderType="Market",
+                qty=str(close_qty.quantize(Decimal("1"), rounding=ROUND_DOWN)),
+                reduceOnly=True
+            )
+            self.active_trades[symbol]["qty"] = old_qty - close_qty
+            self.active_trades[symbol]["partial_tp_done"] = True
+            self.send_telegram_message(f"⚙ Частичное закрытие {symbol}: {fraction * 100}% позиции.")
+        except Exception:
+            logging.error("Error in partial close")
+            logging.error(traceback.format_exc())
 
-            await send_telegram_message(format_balance_message(usdt_balance))
+    def close_trade(self, symbol):
+        if symbol not in self.active_trades:
+            return
+        try:
+            price_data = self.client.get_tickers(category="linear", symbol=symbol)
+            exit_price = Decimal(price_data["result"]["list"][0]["lastPrice"])
+            side = self.active_trades[symbol]["side"]
+            entry_price = self.active_trades[symbol]["entry_price"]
+            trade_qty = self.active_trades[symbol]["qty"]
+            profit = (exit_price - entry_price) * trade_qty if side == "Buy" else (entry_price - exit_price) * trade_qty
+            total_balance, _ = self.get_balance()
+            self.send_telegram_message(
+                f"❎ Закрыта сделка по {symbol}\n"
+                f"Цена входа: {entry_price}\n"
+                f"Цена выхода: {exit_price}\n"
+                f"Прибыль (монет): {profit:.4f}\n"
+                f"Текущий баланс: {total_balance:.2f} USDT"
+            )
+            del self.active_trades[symbol]
+        except Exception:
+            logging.error("Error closing trade")
+            logging.error(traceback.format_exc())
 
-            if usdt_balance < MIN_TRADE_BALANCE:
-                logging.warning("Недостаточный баланс для торговли.")
-                await send_telegram_message("Недостаточный баланс для торговли.")
-                continue
+    def monitor_positions(self):
+        try:
+            positions = self.client.get_positions(category="linear", settleCoin="USDT")
+            if "result" in positions and "list" in positions["result"]:
+                for pos in positions["result"]["list"]:
+                    sym = pos["symbol"]
+                    size = Decimal(pos["size"])
+                    if sym in self.active_trades and size == 0:
+                        self.close_trade(sym)
+        except Exception:
+            logging.error("Error monitoring positions")
+            logging.error(traceback.format_exc())
 
-            for symbol in SYMBOLS_TO_TRADE:
-                market_data = analyze_market(symbol)
-                if market_data is None:
-                    continue
+    def update_trailing_stops(self):
+        for symbol, trade_info in list(self.active_trades.items()):
+            side = trade_info["side"]
+            try:
+                price_data = self.client.get_tickers(category="linear", symbol=symbol)
+                current_price = Decimal(price_data["result"]["list"][0]["lastPrice"])
+                entry_price = trade_info["entry_price"]
+                current_stop = trade_info.get("stop_loss", entry_price)
+                prev_price = trade_info.get("prev_price", current_price)
 
-                rsi, macd, signal, upper_band, lower_band, atr = market_data
+                if side == "Buy":
+                    if current_price <= current_stop:
+                        self.close_trade(symbol)
+                        continue
+                    current_profit_pct = (current_price / entry_price - Decimal("1")) * Decimal("100")
+                    if not trade_info["partial_tp_done"] and current_profit_pct >= self.TP_PARTIAL_LEVEL * Decimal("100"):
+                        self.partial_close_trade(symbol, self.TP_PARTIAL_SIZE)
+                    if "highest_price" in trade_info and current_price > trade_info["highest_price"]:
+                        self.active_trades[symbol]["highest_price"] = current_price
+                    if current_profit_pct > 0 and current_price < prev_price * (Decimal("1") - self.REVERSAL_DROP):
+                        self.close_trade(symbol)
+                        continue
+                else:
+                    if current_price >= current_stop:
+                        self.close_trade(symbol)
+                        continue
+                    current_profit_pct = (entry_price / current_price - Decimal("1")) * Decimal("100")
+                    if not trade_info["partial_tp_done"] and current_profit_pct >= self.TP_PARTIAL_LEVEL * Decimal("100"):
+                        self.partial_close_trade(symbol, self.TP_PARTIAL_SIZE)
+                    if "lowest_price" in trade_info and current_price < trade_info["lowest_price"]:
+                        self.active_trades[symbol]["lowest_price"] = current_price
+                    if current_profit_pct > 0 and current_price > prev_price * (Decimal("1") + self.REVERSAL_DROP):
+                        self.close_trade(symbol)
+                        continue
+                self.active_trades[symbol]["prev_price"] = current_price
+            except Exception:
+                logging.error(f"Error updating trailing stop for {symbol}")
+                logging.error(traceback.format_exc())
 
-                if rsi < 30 and macd < signal and lower_band:
-                    qty = round(MIN_TRADE_QTY, 2)
-                    entry_price = float(client.get_ticker(symbol=symbol)["result"]["lastPrice"])
-                    open_trade_with_risk_management(symbol, "Buy", qty, entry_price)
-                    await send_telegram_message(format_trade_message(symbol, "Buy", qty, entry_price))
-                elif rsi > 70 and macd > signal and upper_band:
-                    qty = round(MIN_TRADE_QTY, 2)
-                    entry_price = float(client.get_ticker(symbol=symbol)["result"]["lastPrice"])
-                    open_trade_with_risk_management(symbol, "Sell", qty, entry_price)
-                    await send_telegram_message(format_trade_message(symbol, "Sell", qty, entry_price))
+    def run(self):
+        try:
+            self.restore_active_trades()
+            self.send_telegram_message("🚀 Бот запущен!")
+            while True:
+                try:
+                    for symbol in self.symbols:
+                        self.open_trade(symbol)
+                        time.sleep(1)
+                    self.update_trailing_stops()
+                    self.monitor_positions()
+                except Exception:
+                    logging.error("Error in main loop iteration")
+                    logging.error(traceback.format_exc())
+                    time.sleep(30)
+                time.sleep(5)
+        except Exception:
+            logging.error("Error running bot")
+            logging.error(traceback.format_exc())
 
-        except Exception as e:
-            logging.error(f"Ошибка в основном цикле: {e}")
-        finally:
-            await asyncio.sleep(60)  # Задержка в 60 секунд перед следующей итерацией
-
-# Запуск бота
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    bot = TradeBot()
+    bot.run()

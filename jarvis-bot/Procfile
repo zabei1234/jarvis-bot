@@ -1,3 +1,2 @@
-
 worker: python3 bybit_bot.py
 
