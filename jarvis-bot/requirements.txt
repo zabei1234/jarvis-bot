@@ -1,6 +1,6 @@
 requests
-python-decouple
-telebot
+six==1.17.0
+urllib3==1.26.16
 bybit
-urllib3
-
+telebot
+python-decouple
